@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>3D Shooter</title>
+<style>
+  body { margin:0; height:100vh; background:#111; color:#ddd; font-family:sans-serif;
+         display:flex; flex-direction:column; align-items:center; justify-content:center; }
+  #wrap { position:relative; }
+  canvas { display:block; background:#0a0a14; border:2px solid #444; }
+  #hud { position:absolute; top:10px; left:12px; font-size:18px; pointer-events:none; text-shadow:0 0 4px #000; }
+  #crosshair { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+               font-size:22px; color:#fff; pointer-events:none; text-shadow:0 0 4px #000; }
+  #msg { position:absolute; inset:0; display:none; flex-direction:column; align-items:center;
+         justify-content:center; background:rgba(0,0,0,.6); text-align:center; pointer-events:none; }
+  #msg h1 { font-size:42px; margin:0 0 8px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="800" height="500"></canvas>
+  <div id="hud">Score: 0 · HP: 3</div>
+  <div id="crosshair">+</div>
+  <div id="msg"><h1>3D Shooter</h1><p>Click to play · Restart: R</p></div>
+</div>
+<p>Move: ZQSD / arrows · Aim: mouse · Shoot: click or Space · Restart: R</p>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ===== SETUP =====
+const canvas = document.getElementById('game');
+const hud = document.getElementById('hud');
+const msg = document.getElementById('msg');
+const W = 800, H = 500;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a14);
+scene.fog = new THREE.Fog(0x0a0a14, 25, 90);
+
+const camera = new THREE.PerspectiveCamera(75, W / H, 0.1, 300);
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setSize(W, H);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+sun.position.set(20, 40, 10);
+scene.add(sun);
+
+// Floor + grid
+const floor = new THREE.Mesh(
+  new THREE.PlaneGeometry(300, 300),
+  new THREE.MeshLambertMaterial({ color: 0x1b1b2f })
+);
+floor.rotation.x = -Math.PI / 2;
+scene.add(floor);
+const grid = new THREE.GridHelper(300, 60, 0x444466, 0x2a2a3a);
+grid.position.y = 0.01;
+scene.add(grid);
+
+// ===== MAP =====
+const ARENA = 40;
+const obstacles = []; // {minX, maxX, minZ, maxZ}
+const wallMat = new THREE.MeshLambertMaterial({ color: 0x3d3d5c });
+
+function addWall(x, z, w, d, h) {
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), wallMat);
+  mesh.position.set(x, h / 2, z);
+  scene.add(mesh);
+  obstacles.push({ minX: x - w / 2, maxX: x + w / 2, minZ: z - d / 2, maxZ: z + d / 2 });
+}
+
+function buildMap() {
+  // Arena boundary
+  addWall(0, -ARENA, ARENA * 2 + 2, 2, 6);
+  addWall(0,  ARENA, ARENA * 2 + 2, 2, 6);
+  addWall(-ARENA, 0, 2, ARENA * 2 + 2, 6);
+  addWall( ARENA, 0, 2, ARENA * 2 + 2, 6);
+  // Scattered buildings, keeping the spawn area clear and no overlaps
+  let placed = 0, guard = 0;
+  while (placed < 14 && guard++ < 300) {
+    const w = 3 + Math.random() * 6, d = 3 + Math.random() * 6, h = 3 + Math.random() * 6;
+    const x = (Math.random() * 2 - 1) * (ARENA - 7);
+    const z = (Math.random() * 2 - 1) * (ARENA - 7);
+    if (Math.hypot(x, z) < 12) continue;
+    if (obstacles.some(o => x + w / 2 + 2 > o.minX && x - w / 2 - 2 < o.maxX &&
+                            z + d / 2 + 2 > o.minZ && z - d / 2 - 2 < o.maxZ)) continue;
+    addWall(x, z, w, d, h);
+    placed++;
+  }
+}
+
+function insideObstacle(x, z, r) {
+  return obstacles.some(o => x > o.minX - r && x < o.maxX + r && z > o.minZ - r && z < o.maxZ + r);
+}
+
+// Push a point (x, z) out of any overlapping obstacle (AABB resolution)
+function collide(x, z, r) {
+  let px = x, pz = z;
+  for (const o of obstacles) {
+    const minX = o.minX - r, maxX = o.maxX + r, minZ = o.minZ - r, maxZ = o.maxZ + r;
+    if (px > minX && px < maxX && pz > minZ && pz < maxZ) {
+      const dl = px - minX, dr = maxX - px, df = pz - minZ, db = maxZ - pz;
+      const m = Math.min(dl, dr, df, db);
+      if (m === dl) px = minX; else if (m === dr) px = maxX;
+      else if (m === df) pz = minZ; else pz = maxZ;
+    }
+  }
+  return [px, pz];
+}
+
+buildMap();
+
+// ===== STATE =====
+const keys = {};
+let mouseDown = false;
+const player = { hp: 3, speed: 14, invuln: 0, yaw: 0, pitch: 0 };
+let bullets, enemies, score, gameOver, spawnTimer, shootCooldown;
+const BULLET_MAT = new THREE.MeshBasicMaterial({ color: 0xf1c40f });
+const ENEMY_MAT = new THREE.MeshLambertMaterial({ color: 0xe74c3c });
+
+function reset() {
+  bullets.forEach(b => scene.remove(b.mesh));
+  enemies.forEach(en => scene.remove(en.mesh));
+  bullets = []; enemies = [];
+  player.hp = 3; player.invuln = 0;
+  player.yaw = 0; player.pitch = 0;
+  camera.position.set(0, 1.6, 0);
+  score = 0; gameOver = false; spawnTimer = 0; shootCooldown = 0;
+  showMsg('3D Shooter', 'Click to play · Restart: R');
+  updateHud();
+}
+
+function updateHud() {
+  hud.textContent = 'Score: ' + score + ' · HP: ' + player.hp;
+}
+
+function showMsg(title, text) {
+  msg.querySelector('h1').textContent = title;
+  msg.querySelector('p').textContent = text;
+  msg.style.display = 'flex';
+}
+
+// ===== INPUT =====
+addEventListener('keydown', e => {
+  keys[e.key.toLowerCase()] = true;
+  if (e.key === ' ') e.preventDefault();
+  if (e.key.toLowerCase() === 'r' && gameOver) reset();
+});
+addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+canvas.addEventListener('click', () => {
+  if (!gameOver && !document.pointerLockElement) canvas.requestPointerLock();
+});
+document.addEventListener('pointerlockchange', () => {
+  if (document.pointerLockElement === canvas) {
+    msg.style.display = 'none';
+  } else if (!gameOver) {
+    showMsg('3D Shooter', 'Click to resume · Restart: R');
+  }
+});
+document.addEventListener('mousemove', e => {
+  if (document.pointerLockElement !== canvas) return;
+  player.yaw -= e.movementX * 0.0022;
+  player.pitch = Math.max(-1.45, Math.min(1.45, player.pitch - e.movementY * 0.0022));
+});
+canvas.addEventListener('mousedown', () => mouseDown = true);
+addEventListener('mouseup', () => mouseDown = false);
+
+// ===== GAME LOGIC =====
+function spawnEnemy() {
+  let x, z, guard = 0;
+  do {
+    x = (Math.random() * 2 - 1) * (ARENA - 4);
+    z = (Math.random() * 2 - 1) * (ARENA - 4);
+  } while ((insideObstacle(x, z, 1) ||
+            Math.hypot(x - camera.position.x, z - camera.position.z) < 18) && guard++ < 100);
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(1.4, 1.4, 1.4), ENEMY_MAT);
+  mesh.position.set(x, 0.7, z);
+  scene.add(mesh);
+  enemies.push({ mesh, speed: 4 + score * 0.15 });
+}
+
+function shoot() {
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir);
+  const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.12, 8, 8), BULLET_MAT);
+  mesh.position.copy(camera.position).addScaledVector(dir, 1);
+  scene.add(mesh);
+  bullets.push({ mesh, vel: dir.multiplyScalar(70), life: 1.5 });
+  shootCooldown = 0.2;
+}
+
+function endGame() {
+  gameOver = true;
+  document.exitPointerLock();
+  showMsg('Game over — score ' + score, 'Press R to restart');
+}
+
+function update(dt) {
+  if (gameOver) return;
+
+  // Player movement (relative to view yaw)
+  const fwd = (keys['z'] || keys['arrowup'] ? 1 : 0) - (keys['s'] || keys['arrowdown'] ? 1 : 0);
+  const strafe = (keys['d'] || keys['arrowright'] ? 1 : 0) - (keys['q'] || keys['arrowleft'] ? 1 : 0);
+  const sin = Math.sin(player.yaw), cos = Math.cos(player.yaw);
+  camera.position.x += (-sin * fwd + cos * strafe) * player.speed * dt;
+  [camera.position.x, camera.position.z] = collide(camera.position.x, camera.position.z, 0.6);
+  camera.position.z += (-cos * fwd - sin * strafe) * player.speed * dt;
+  camera.position.y = 1.6;
+  camera.rotation.set(player.pitch, player.yaw, 0, 'YXZ');
+  player.invuln = Math.max(0, player.invuln - dt);
+
+  // Shooting
+  shootCooldown -= dt;
+  if ((mouseDown || keys[' ']) && shootCooldown <= 0 && document.pointerLockElement === canvas) shoot();
+
+  // Bullets
+  for (const b of bullets) {
+    b.mesh.position.addScaledVector(b.vel, dt);
+    if (insideObstacle(b.mesh.position.x, b.mesh.position.z, 0.1)) b.life = 0;
+    b.life -= dt;
+  }
+
+  // Enemy spawning + chasing
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) { spawnEnemy(); spawnTimer = Math.max(0.3, 1.1 - score * 0.02); }
+  for (const en of enemies) {
+    const dx = camera.position.x - en.mesh.position.x;
+    const dz = camera.position.z - en.mesh.position.z;
+    const d = Math.hypot(dx, dz) || 1;
+    en.mesh.position.x += dx / d * en.speed * dt;
+    const [ex, ez] = collide(en.mesh.position.x, en.mesh.position.z, 0.8);
+    en.mesh.position.x = ex; en.mesh.position.z = ez;
+    en.mesh.position.z += dz / d * en.speed * dt;
+    en.mesh.rotation.y += dt * 2;
+  }
+
+  // Bullet hits enemy
+  for (const b of bullets) for (const en of enemies) {
+    if (!en.dead && b.life > 0 && b.mesh.position.distanceTo(en.mesh.position) < 1.1) {
+      en.dead = true; b.life = 0; score++;
+      scene.remove(en.mesh);
+    }
+  }
+
+  // Enemy hits player
+  for (const en of enemies) {
+    if (!en.dead && player.invuln <= 0 && en.mesh.position.distanceTo(camera.position) < 2.2) {
+      en.dead = true; player.hp--; player.invuln = 1;
+      scene.remove(en.mesh);
+      if (player.hp <= 0) endGame();
+    }
+  }
+
+  // Cleanup
+  bullets = bullets.filter(b => { if (b.life <= 0) scene.remove(b.mesh); return b.life > 0; });
+  enemies = enemies.filter(en => !en.dead);
+  updateHud();
+}
+
+// ===== MAIN LOOP =====
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  update(dt);
+  renderer.render(scene, camera);
+  requestAnimationFrame(loop);
+}
+
+// Init
+bullets = []; enemies = [];
+score = 0; gameOver = false; spawnTimer = 0; shootCooldown = 0;
+camera.position.set(0, 1.6, 0);
+showMsg('3D Shooter', 'Click to play · Restart: R');
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
